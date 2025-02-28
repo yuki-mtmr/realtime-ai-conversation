@@ -19,7 +19,7 @@ async def websocket_endpoint(websocket: WebSocket):
     browser_receive_stream = websocket_stream(websocket)
 
     agent = OpenAIVoiceReactAgent(
-        model="gpt-4o-realtime-preview",
+        model="gpt-4o-mini-realtime-preview",
         tools=TOOLS,
         instructions=INSTRUCTIONS,
     )
