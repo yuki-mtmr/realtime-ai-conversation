@@ -1,12 +1,22 @@
 from langchain_core.tools import tool
 
 from langchain_community.tools import TavilySearchResults
+import requests
 
 
 @tool
-def add(a: int, b: int):
-    """Add two numbers. Please let the user know that you're adding the numbers BEFORE you call the tool"""
-    return a + b
+def translate_text(text: str, target_language: str = "en"):
+    """Translate text between English and Japanese."""
+
+    url = "https://api-free.deepl.com/v2/translate"
+    params = {
+        "auth_key": "YOUR_DEEPL_API_KEY",
+        "text": text,
+        "target_lang": "EN" if target_language == "en" else "JA"
+    }
+    response = requests.post(url, data=params).json()
+
+    return response["translations"][0]["text"]
 
 
 tavily_tool = TavilySearchResults(
@@ -18,4 +28,4 @@ tavily_tool = TavilySearchResults(
     ),
 )
 
-TOOLS = [add, tavily_tool]
+TOOLS = [translate_text, tavily_tool]
