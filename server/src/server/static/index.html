@@ -3,11 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Microphone to Speaker</title>
+    <title>AI Voice Conversation</title>
     <style>
         body {
             font-family: Arial, sans-serif;
             display: flex;
+            flex-direction: column;
             justify-content: center;
             align-items: center;
             height: 100vh;
@@ -27,14 +28,21 @@
         #toggleAudio:hover {
             background-color: #45a049;
         }
+        #status {
+            margin-top: 20px;
+            color: #666;
+        }
     </style>
 </head>
 <body>
     <button id="toggleAudio">Start Audio</button>
+    <div id="status"></div>
 
     <script>
         // Create audio context
         const BUFFER_SIZE = 4800;
+        const statusElement = document.getElementById('status');
+
         class Player {
             constructor() {
                 this.playbackNode = null;
@@ -42,7 +50,7 @@
 
             async init(sampleRate) {
                 const audioContext = new AudioContext({ sampleRate });
-                await audioContext.audioWorklet.addModule("/audio-playback-worklet.js");
+                await audioContext.audioWorklet.addModule("/static/audio-playback-worklet.js");
 
                 this.playbackNode = new AudioWorkletNode(audioContext, "audio-playback-worklet");
                 this.playbackNode.connect(audioContext.destination);
@@ -59,7 +67,7 @@
                     this.playbackNode.port.postMessage(null);
                 }
             }
-        }   
+        }
 
         class Recorder {
             constructor(onDataAvailable) {
@@ -71,17 +79,13 @@
             }
 
             async start(stream) {
-                console.log('starting')
                 try {
                     if (this.audioContext) {
                         await this.audioContext.close();
                     }
 
                     this.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-                    console.log('1')
-
-                    await this.audioContext.audioWorklet.addModule("/audio-processor-worklet.js");
-                    console.log('2')
+                    await this.audioContext.audioWorklet.addModule("/static/audio-processor-worklet.js");
 
                     this.mediaStream = stream;
                     this.mediaStreamSource = this.audioContext.createMediaStreamSource(this.mediaStream);
@@ -93,9 +97,10 @@
 
                     this.mediaStreamSource.connect(this.workletNode);
                     this.workletNode.connect(this.audioContext.destination);
-                    console.log('done')
+                    statusElement.textContent = "Recording started";
                 } catch (error) {
-                    console.log('error', error)
+                    console.error('Recorder error:', error);
+                    statusElement.textContent = `Error: ${error.message}`;
                     this.stop();
                 }
             }
@@ -113,32 +118,33 @@
 
                 this.mediaStreamSource = null;
                 this.workletNode = null;
+                statusElement.textContent = "Recording stopped";
             }
         }
-
-
-
 
         // Function to get microphone input and send it to WebSocket
         async function startAudio() {
             try {
-
                 // handle output -> speaker stuff
-                const ws = new WebSocket("ws://localhost:3000/ws");
+                const ws = new WebSocket(`ws://${window.location.host}/ws`);
 
                 const audioPlayer = new Player();
-                audioPlayer.init(24000);
+                await audioPlayer.init(24000);
 
                 ws.onmessage = event => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data?.type !== 'response.audio.delta') return;
 
-                    const data = JSON.parse(event.data);
-                    if (data?.type !== 'response.audio.delta') return;
+                        const binary = atob(data.delta);
+                        const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+                        const pcmData = new Int16Array(bytes.buffer);
 
-                    const binary = atob(data.delta);
-                    const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-                    const pcmData = new Int16Array(bytes.buffer);
-
-                    audioPlayer.play(pcmData);
+                        audioPlayer.play(pcmData);
+                    } catch (error) {
+                        console.error('WebSocket message error:', error);
+                        statusElement.textContent = `WebSocket error: ${error.message}`;
+                    }
                 };
 
                 let buffer = new Uint8Array();
@@ -168,12 +174,12 @@
                 // handle microphone -> input websocket
                 const audioRecorder = new Recorder(handleAudioData);
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
                 await audioRecorder.start(stream);
-                
+                statusElement.textContent = "Connected and recording";
 
             } catch (error) {
-                console.error('Error accessing the microphone', error);
+                console.error('Error:', error);
+                statusElement.textContent = `Error: ${error.message}. Please check your microphone settings.`;
                 alert('Error accessing the microphone. Please check your settings and try again.');
             }
         }
@@ -188,12 +194,11 @@
                 toggleButton.textContent = 'Stop Audio';
                 isAudioOn = true;
             } else {
-                // audioContext.suspend();
+                location.reload(); // 簡単な方法として、ページをリロード
                 toggleButton.textContent = 'Start Audio';
                 isAudioOn = false;
             }
         });
-
     </script>
 </body>
 </html>
