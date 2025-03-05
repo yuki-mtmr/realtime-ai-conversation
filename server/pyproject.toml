@@ -9,6 +9,11 @@ dependencies = [
     "langgraph>=0.2.32",
     "starlette>=0.39.2",
     "uvicorn[standard]>=0.31.0",
+    "fastapi>=0.115.0",
+    "python-dotenv>=1.0.0",
+    "tavily-python>=0.3.0",
+    "requests>=2.31.0",
+    "websockets>=12.0",
 ]
 
 [build-system]

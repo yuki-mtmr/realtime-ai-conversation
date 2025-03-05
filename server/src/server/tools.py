@@ -1,4 +1,5 @@
 from langchain_core.tools import tool
+from langchain_community.tools import TavilySearchResults
 import requests
 import os
 from dotenv import load_dotenv
@@ -20,15 +21,14 @@ def translate_text(text: str, target_language: str = "en"):
 
     return response["translations"][0]["text"]
 
-# Tavilyツールを一時的にコメントアウト
-# tavily_tool = TavilySearchResults(
-#     max_results=5,
-#     include_answer=True,
-#     description=(
-#         "This is a search tool for accessing the internet.\n\n"
-#         "Let the user know you're asking your friend Tavily for help before you call the tool."
-#     ),
-# )
 
+tavily_tool = TavilySearchResults(
+    max_results=5,
+    include_answer=True,
+    description=(
+        "This is a search tool for accessing the internet.\n\n"
+        "Let the user know you're asking your friend Tavily for help before you call the tool."
+    ),
+)
 
-TOOLS = [translate_text]  # tavilyツールを除外
+TOOLS = [translate_text, tavily_tool]
