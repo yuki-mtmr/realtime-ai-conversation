@@ -54,12 +54,16 @@ async def connect(*, api_key: str, model: str, url: str) -> AsyncGenerator[
     url = url or DEFAULT_URL
     url += f"?model={model}"
 
-    websocket = await websockets.connect(url, extra_headers=headers)
+    websocket = await websockets.connect(
+        url,
+        additional_headers=headers  # extra_headersをadditional_headersに変更
+    )
 
     try:
 
         async def send_event(event: dict[str, Any] | str) -> None:
-            formatted_event = json.dumps(event) if isinstance(event, dict) else event
+            formatted_event = json.dumps(
+                event) if isinstance(event, dict) else event
             await websocket.send(formatted_event)
 
         async def event_stream() -> AsyncIterator[dict[str, Any]]:
@@ -79,7 +83,8 @@ class VoiceToolExecutor(BaseModel):
     """
 
     tools_by_name: dict[str, BaseTool]
-    _trigger_future: asyncio.Future = PrivateAttr(default_factory=asyncio.Future)
+    _trigger_future: asyncio.Future = PrivateAttr(
+        default_factory=asyncio.Future)
     _lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
 
     async def _trigger_func(self) -> dict:  # returns a tool call
@@ -229,7 +234,8 @@ class OpenAIVoiceReactAgent(BaseModel):
             ):
                 try:
                     data = (
-                        json.loads(data_raw) if isinstance(data_raw, str) else data_raw
+                        json.loads(data_raw) if isinstance(
+                            data_raw, str) else data_raw
                     )
                 except json.JSONDecodeError:
                     print("error decoding data:", data_raw)
