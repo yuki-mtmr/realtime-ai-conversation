@@ -1,7 +1,10 @@
 from langchain_core.tools import tool
-
 from langchain_community.tools import TavilySearchResults
 import requests
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 @tool
@@ -10,7 +13,7 @@ def translate_text(text: str, target_language: str = "en"):
 
     url = "https://api-free.deepl.com/v2/translate"
     params = {
-        "auth_key": "YOUR_DEEPL_API_KEY",
+        "auth_key": os.getenv("DEEPL_API_KEY"),
         "text": text,
         "target_lang": "EN" if target_language == "en" else "JA"
     }
