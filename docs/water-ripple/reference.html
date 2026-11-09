@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Water Ripple Reference</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b2a26; overflow: hidden; }
+  #gl { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; }
+  #card { box-sizing: border-box; width: 320px; padding: 20px; border-radius: 16px;
+          background: #e8f7f2; color: #123; font: 14px/1.5 system-ui, sans-serif; }
+  #card h2 { margin: 0 0 6px; font-size: 20px; }
+  #card p { margin: 0 0 12px; }
+  #card input { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 8px; border: 1px solid #567; font: inherit; }
+  #card button { margin-top: 8px; width: 100%; padding: 10px; border: 0; border-radius: 8px; background: #0d3b33; color: #fff; font: inherit; }
+  #status { position: fixed; left: 8px; bottom: 8px; color: #9cc; font: 12px monospace; pointer-events: none; }
+</style>
+</head>
+<body>
+<!-- content="drawable": HTML-in-Canvas (Chrome 157+). 非対応ブラウザでは子要素は fallback 扱いで描かれない -->
+<canvas id="gl" content="drawable">
+  <div id="card" drawable>
+    <h2>Wishing pond</h2>
+    <p>Type a wish and toss a coin in.</p>
+    <input placeholder="I wish..." aria-label="wish">
+    <button type="button">Toss a coin</button>
+  </div>
+</canvas>
+<div id="status"></div>
+<script>
+'use strict';
+
+// ---------- 調整パラメータ（ここだけ触れば見た目が変わる） ----------
+const PARAMS = Object.freeze({
+  simLongSide: 384,      // シミュレーション格子の長辺セル数（256〜512）
+  damping: 0.992,        // 速度の減衰（1 に近いほど長く残る）
+  dropRadiusPx: 18,      // 指 1 本ぶんの半径（CSS px）
+  dropStrength: 0.9,     // 1 区間あたりに足す高さ
+  refraction: 0.06,      // 高さ勾配 → UV ずれ量
+  dispersion: 0.35,      // RGB のずれ比（色収差）
+  caustics: 1.8,         // ラプラシアン由来の集光の強さ
+  specular: 0.5,         // ハイライト強度
+  stepHz: 60,            // 固定タイムステップ（120Hz 端末でも速さを揃える）
+  idleDropMs: 1400,      // 何もしなくても時々落ちる雫（0 で無効）
+});
+
+const canvas = document.getElementById('gl');
+const card = document.getElementById('card');
+const statusEl = document.getElementById('status');
+
+function supportsHtmlInCanvas() {
+  const c = document.createElement('canvas');
+  c.setAttribute('content', 'drawable');
+  return c.content === 'drawable';
+}
+const HIC = supportsHtmlInCanvas() && typeof canvas.requestPaint === 'function';
+
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+if (!gl) throw new Error('WebGL2 not available');
+const floatExt = gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float');
+if (!floatExt) throw new Error('float render target not available');
+
+// ---------- shaders ----------
+const VS = `#version 300 es
+in vec2 aPos; out vec2 vUv;
+void main(){ vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+
+// 指の軌跡を「点」ではなく「線分」で注入する → なぞった跡が途切れない
+const DROP_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uState; uniform vec2 uA; uniform vec2 uB;
+uniform vec2 uAspect; uniform float uRadius; uniform float uStrength;
+float segDist(vec2 p, vec2 a, vec2 b){
+  vec2 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-8), 0.0, 1.0);
+  return length(pa - ba * h);
+}
+void main(){
+  vec4 s = texture(uState, vUv);
+  float d = segDist(vUv * uAspect, uA * uAspect, uB * uAspect) / uRadius;
+  float drop = max(0.0, 1.0 - d);
+  drop = 0.5 - 0.5 * cos(drop * 3.14159265);
+  s.r += drop * uStrength;
+  o = s;
+}`;
+
+// 波動方程式（R=高さ, G=速度）
+const UPDATE_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uState; uniform vec2 uTexel; uniform float uDamping;
+void main(){
+  vec4 s = texture(uState, vUv);
+  float avg = 0.25 * (
+    texture(uState, vUv + vec2(uTexel.x, 0.0)).r + texture(uState, vUv - vec2(uTexel.x, 0.0)).r +
+    texture(uState, vUv + vec2(0.0, uTexel.y)).r + texture(uState, vUv - vec2(0.0, uTexel.y)).r);
+  s.g += (avg - s.r) * 2.0;
+  s.g *= uDamping;
+  s.r += s.g;
+  s.r *= 0.9995;
+  o = s;
+}`;
+
+// 屈折させる「下の世界」= 池の底 + 蓮 + HTML カード
+const SCENE_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform float uAspectX; uniform float uTime;
+uniform sampler2D uCard; uniform vec4 uCardRect; uniform float uHasCard;
+float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1,0)), u.x), mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), u.x), u.y); }
+float fbm(vec2 p){ float v = 0.0, a = 0.5; for(int i = 0; i < 4; i++){ v += a * vnoise(p); p *= 2.03; a *= 0.5; } return v; }
+vec3 lily(vec2 p, vec2 c, float r, float rot, vec3 col){
+  vec2 d = p - c; float len = length(d);
+  float ang = atan(d.y, d.x) - rot; ang = mod(ang + 3.14159265, 6.2831853) - 3.14159265;
+  float cut = smoothstep(0.22, 0.28, abs(ang));
+  float shadow = smoothstep(r * 1.08, r * 0.9, length(d - vec2(0.012, -0.012)));
+  col = mix(col, col * 0.55, shadow * 0.6);
+  float m = smoothstep(r, r - 0.004, len) * cut;
+  vec3 g = mix(vec3(0.15, 0.42, 0.18), vec3(0.30, 0.62, 0.28), 0.5 + 0.5 * cos(ang * 22.0));
+  g *= 0.85 + 0.25 * (len / r);
+  return mix(col, g, m);
+}
+void main(){
+  vec2 p = vUv * vec2(uAspectX, 1.0);
+  vec3 col = mix(vec3(0.03, 0.15, 0.13), vec3(0.08, 0.30, 0.26), fbm(p * 2.2 + uTime * 0.01));
+  vec2 g = p * 16.0; vec2 id = floor(g); vec2 f = fract(g) - 0.5;
+  vec2 jit = vec2(hash(id), hash(id + 7.1)) - 0.5;
+  float pr = 0.10 + 0.16 * hash(id + 3.3);
+  float pebble = smoothstep(pr, pr - 0.12, length(f - jit * 0.5)) * step(0.72, hash(id + 1.7));
+  col = mix(col, vec3(0.02, 0.09, 0.08), pebble * 0.55);
+  col = lily(p, vec2(0.18 * uAspectX, 0.82), 0.085, 0.8, col);
+  col = lily(p, vec2(0.86 * uAspectX, 0.28), 0.11, 2.4, col);
+  col = lily(p, vec2(0.72 * uAspectX, 0.08), 0.07, -1.2, col);
+  if (uHasCard > 0.5) {
+    vec2 cuv = (vUv - uCardRect.xy) / (uCardRect.zw - uCardRect.xy);
+    if (all(greaterThanEqual(cuv, vec2(0.0))) && all(lessThanEqual(cuv, vec2(1.0)))) {
+      vec4 c = texture(uCard, vec2(cuv.x, 1.0 - cuv.y)); // DOM テクスチャは上が 0 行目 → Y 反転
+      col = mix(col, c.rgb, c.a);
+    }
+  }
+  o = vec4(col, 1.0);
+}`;
+
+// 水面: 勾配で屈折（RGB 別にずらして色収差）+ 集光 + スペキュラ
+const WATER_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uState; uniform sampler2D uScene; uniform vec2 uTexel;
+uniform float uRefraction; uniform float uDispersion; uniform float uCaustics; uniform float uSpecular;
+void main(){
+  float hC = texture(uState, vUv).r;
+  float hL = texture(uState, vUv - vec2(uTexel.x, 0.0)).r;
+  float hR = texture(uState, vUv + vec2(uTexel.x, 0.0)).r;
+  float hD = texture(uState, vUv - vec2(0.0, uTexel.y)).r;
+  float hU = texture(uState, vUv + vec2(0.0, uTexel.y)).r;
+  vec2 grad = vec2(hR - hL, hU - hD);
+  vec2 off = -grad * uRefraction;
+  vec3 col;
+  col.r = texture(uScene, vUv + off * (1.0 + uDispersion)).r;
+  col.g = texture(uScene, vUv + off).g;
+  col.b = texture(uScene, vUv + off * (1.0 - uDispersion)).b;
+  float lap = hL + hR + hD + hU - 4.0 * hC;
+  col += vec3(0.55, 0.85, 0.80) * clamp(-lap * uCaustics, 0.0, 0.6);
+  vec3 n = normalize(vec3(-grad * 6.0, 1.0));
+  vec3 L = normalize(vec3(-0.4, 0.6, 1.0));
+  float spec = pow(max(dot(reflect(-L, n), vec3(0.0, 0.0, 1.0)), 0.0), 90.0);
+  col += spec * uSpecular;
+  o = vec4(col, 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.bindAttribLocation(p, 0, 'aPos');
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const name = gl.getActiveUniform(p, i).name; u[name] = gl.getUniformLocation(p, name); }
+  return { p, u };
+}
+const P = { drop: program(DROP_FS), update: program(UPDATE_FS), scene: program(SCENE_FS), water: program(WATER_FS) };
+
+// 全画面三角形
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+function makeTarget(w, h, internal, format, type, filter) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('FBO incomplete');
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fb, w, h };
+}
+
+let state = null;   // { a, b, w, h }
+let scene = null;
+const cardTex = gl.createTexture();
+let cardRect = [0, 0, 0, 0];
+let hasCard = false;
+
+function allocate() {
+  const W = canvas.width, H = canvas.height;
+  const aspect = W / H;
+  const sw = aspect >= 1 ? PARAMS.simLongSide : Math.round(PARAMS.simLongSide * aspect);
+  const sh = aspect >= 1 ? Math.round(PARAMS.simLongSide / aspect) : PARAMS.simLongSide;
+  const mk = () => makeTarget(sw, sh, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR);
+  state = { a: mk(), b: mk(), w: sw, h: sh };
+  scene = makeTarget(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
+  layoutCard();
+}
+
+// ---------- HTML カード ----------
+function layoutCard() {
+  const cw = canvas.clientWidth, ch = canvas.clientHeight;
+  const ew = card.offsetWidth, eh = card.offsetHeight;
+  const x = (cw - ew) / 2, y = (ch - eh) / 2;
+  // UV は左下原点
+  cardRect = [x / cw, 1 - (y + eh) / ch, (x + ew) / cw, 1 - y / ch];
+  if (HIC) {
+    // ヒットテスト・フォーカスリング・a11y の位置をシェーダーの描画位置と合わせる
+    canvas.updateElementGeometry(card, { canvasTransform: new DOMMatrix().translate(x, y) });
+  }
+}
+// 注意: getElementImageDefaultSize は最初の paint 前だと InvalidStateError
+// ("No cached paint record") になるので、paint ハンドラ内で遅延確保する
+let cardTexSize = [0, 0];
+function ensureCardTexture() {
+  const sz = canvas.getElementImageDefaultSize(card);
+  const w = Math.ceil(sz.width), h = Math.ceil(sz.height);
+  if (w === cardTexSize[0] && h === cardTexSize[1]) return;
+  cardTexSize = [w, h];
+  gl.bindTexture(gl.TEXTURE_2D, cardTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  setTexParams();
+}
+function setTexParams() {
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+function uploadCardFromDom() {
+  ensureCardTexture();
+  gl.bindTexture(gl.TEXTURE_2D, cardTex);
+  gl.texElementSubImage2D(gl.TEXTURE_2D, 0, 0, 0, card);
+  hasCard = true;
+}
+// 非対応ブラウザ: Canvas2D で静止画カードを作って同じパイプラインに流す（操作は不可）
+function uploadCardFallback() {
+  card.remove();
+  const ew = 320, eh = 190, s = 2;
+  const c2 = document.createElement('canvas'); c2.width = ew * s; c2.height = eh * s;
+  const g = c2.getContext('2d'); g.scale(s, s);
+  g.fillStyle = '#e8f7f2'; g.beginPath(); g.roundRect(0, 0, ew, eh, 16); g.fill();
+  g.fillStyle = '#123'; g.font = 'bold 20px system-ui'; g.fillText('Wishing pond', 20, 40);
+  g.font = '14px system-ui'; g.fillText('Type a wish and toss a coin in.', 20, 66);
+  g.strokeStyle = '#567'; g.beginPath(); g.roundRect(20, 82, 280, 36, 8); g.stroke();
+  g.fillStyle = '#789'; g.fillText('I wish...', 30, 105);
+  g.fillStyle = '#0d3b33'; g.beginPath(); g.roundRect(20, 128, 280, 42, 8); g.fill();
+  g.fillStyle = '#fff'; g.fillText('Toss a coin', 122, 154);
+  gl.bindTexture(gl.TEXTURE_2D, cardTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c2);
+  setTexParams();
+  const cw = canvas.clientWidth, ch = canvas.clientHeight;
+  const x = (cw - ew) / 2, y = (ch - eh) / 2;
+  cardRect = [x / cw, 1 - (y + eh) / ch, (x + ew) / cw, 1 - y / ch];
+  hasCard = true;
+}
+
+// ---------- 入力: client 座標 → sim UV（左下原点）の線分キュー ----------
+const pendingSegments = [];
+let last = null;
+function toUv(e) {
+  const r = canvas.getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width, 1 - (e.clientY - r.top) / r.height];
+}
+function pushSegment(a, b) { if (pendingSegments.length < 64) pendingSegments.push([a, b]); }
+canvas.addEventListener('pointerdown', (e) => { last = toUv(e); pushSegment(last, last); });
+canvas.addEventListener('pointermove', (e) => {
+  if (e.pointerType === 'mouse' && e.buttons === 0) { last = null; return; } // マウスは押下中のみ
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];        // 高頻度サンプルで軌跡を滑らかに
+  for (const ce of evs) { const p = toUv(ce); if (last) pushSegment(last, p); last = p; }
+});
+['pointerup', 'pointercancel', 'pointerleave'].forEach((t) => canvas.addEventListener(t, () => { last = null; }));
+
+// ---------- 描画ループ ----------
+function bindQuad(prog, target) {
+  gl.useProgram(prog.p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fb : null);
+  gl.viewport(0, 0, target ? target.w : canvas.width, target ? target.h : canvas.height);
+}
+function swap() { const t = state.a; state.a = state.b; state.b = t; }
+function tex(unit, t) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); }
+
+function applyDrops() {
+  const aspect = [canvas.width / canvas.height, 1];
+  const radius = PARAMS.dropRadiusPx / canvas.clientHeight;
+  for (const [a, b] of pendingSegments.splice(0)) {
+    bindQuad(P.drop, state.b); tex(0, state.a.tex);
+    gl.uniform1i(P.drop.u.uState, 0);
+    gl.uniform2f(P.drop.u.uA, a[0], a[1]); gl.uniform2f(P.drop.u.uB, b[0], b[1]);
+    gl.uniform2f(P.drop.u.uAspect, aspect[0], aspect[1]);
+    gl.uniform1f(P.drop.u.uRadius, radius); gl.uniform1f(P.drop.u.uStrength, PARAMS.dropStrength);
+    gl.drawArrays(gl.TRIANGLES, 0, 3); swap();
+  }
+}
+function stepSim() {
+  bindQuad(P.update, state.b); tex(0, state.a.tex);
+  gl.uniform1i(P.update.u.uState, 0);
+  gl.uniform2f(P.update.u.uTexel, 1 / state.w, 1 / state.h);
+  gl.uniform1f(P.update.u.uDamping, PARAMS.damping);
+  gl.drawArrays(gl.TRIANGLES, 0, 3); swap();
+}
+function drawScene(t) {
+  bindQuad(P.scene, scene); tex(1, cardTex);
+  gl.uniform1i(P.scene.u.uCard, 1);
+  gl.uniform1f(P.scene.u.uAspectX, canvas.width / canvas.height);
+  gl.uniform1f(P.scene.u.uTime, t / 1000);
+  gl.uniform4f(P.scene.u.uCardRect, ...cardRect);
+  gl.uniform1f(P.scene.u.uHasCard, hasCard ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+function drawWater() {
+  bindQuad(P.water, null); tex(0, state.a.tex); tex(1, scene.tex);
+  gl.uniform1i(P.water.u.uState, 0); gl.uniform1i(P.water.u.uScene, 1);
+  gl.uniform2f(P.water.u.uTexel, 1 / state.w, 1 / state.h);
+  gl.uniform1f(P.water.u.uRefraction, PARAMS.refraction);
+  gl.uniform1f(P.water.u.uDispersion, PARAMS.dispersion);
+  gl.uniform1f(P.water.u.uCaustics, PARAMS.caustics);
+  gl.uniform1f(P.water.u.uSpecular, PARAMS.specular);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+let acc = 0, prevT = 0, lastIdle = 0;
+function frame(t) {
+  if (!prevT) prevT = t;
+  acc = Math.min(acc + (t - prevT), 1000 / PARAMS.stepHz * 4); prevT = t;
+  if (PARAMS.idleDropMs && t - lastIdle > PARAMS.idleDropMs) {
+    lastIdle = t; const p = [Math.random(), Math.random()]; pushSegment(p, p);
+  }
+  applyDrops();
+  const dt = 1000 / PARAMS.stepHz;
+  while (acc >= dt) { stepSim(); acc -= dt; }
+  drawScene(t);
+  drawWater();
+}
+
+// ---------- サイズ: canvas グリッド = デバイスピクセル ----------
+function resizeTo(w, h) {
+  if (canvas.width === w && canvas.height === h && state) return;
+  canvas.width = w; canvas.height = h;
+  allocate();
+  if (!HIC) uploadCardFallback();
+}
+new ResizeObserver(([entry]) => {
+  const s = entry.devicePixelContentBoxSize?.[0];
+  const w = s ? s.inlineSize : Math.round(entry.contentRect.width * devicePixelRatio);
+  const h = s ? s.blockSize : Math.round(entry.contentRect.height * devicePixelRatio);
+  resizeTo(w, h);
+  if (HIC) canvas.requestPaint();
+}).observe(canvas, { box: 'device-pixel-content-box' });
+
+if (HIC) {
+  // paint イベント内の描画は同フレームに反映される。毎回 requestPaint で連続アニメーション
+  canvas.addEventListener('paint', () => {
+    if (!state) return;
+    uploadCardFromDom();
+    frame(performance.now());
+    canvas.requestPaint();
+  });
+  canvas.requestPaint();
+} else {
+  const loop = (t) => { if (state) frame(t); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+}
+statusEl.textContent = HIC ? 'HTML-in-Canvas: ON (live DOM)' : 'HTML-in-Canvas: OFF (static fallback)';
+window.__ripple = { PARAMS, HIC, pushSegment };
+</script>
+</body>
+</html>
