@@ -3,10 +3,16 @@
 > **この文書の使い方**: 社用 PC の Claude Code に、このフォルダごと読ませて
 > 「`docs/water-ripple/README.md` の指示に従って、既存の波紋実装を診断・修正・検証して」と依頼する。
 > 同じフォルダに **動作確認済みのリファレンス実装** と **検証スクリプト** と **期待画像** がある。
+>
+> **現在のタスクは「★ 今回のタスク」節（すぐ下）。** 波紋そのものは実装済みで、
+> **波紋がオブジェクトに当たった時の「虹（色収差）」と「揺れ」が出ていない**のを直す。
+> 0 章以降は背景知識・共通リファレンスとして必要な時に参照する。
 
 | ファイル | 中身 |
 |---|---|
-| `reference.html` | 単一ファイルの完成形（WebGL2）。ブラウザで開くだけで動く。指/マウスでなぞると波紋 |
+| `reference.html` | 単一ファイルの完成形（WebGL2）。ブラウザで開くだけで動く。指/マウスでなぞると波紋。蓮は波で押し流され・傾き・持ち上がる（浮遊物の揺れ）。`?debug=scene` / `?debug=height` / `?<パラメータ名>=<数値>` 対応 |
+| `verify-object.mjs` | **今回の判定ツール**。指定矩形のオブジェクトを波が横切った時の「揺れ」「虹」を数値で判定（しきい値は較正済み） |
+| `verify-object.test.mjs` | 上の判定関数の単体テスト（`node --test`） |
 | `verify.mjs` | Playwright で「ドラッグ → スクショ → 入力可否 → console error」を自動確認 |
 | `expected-chrome157.png` | Chrome 157 での期待画像（HTML カードが屈折・色収差で歪み、入力欄に実際に入力できている） |
 | `expected-fallback.png` | HTML-in-Canvas 非対応ブラウザ（Chrome 156）での期待画像（カードは静止画として歪む） |
@@ -22,6 +28,111 @@ Chrome for Testing 156 で fallback 経路、Playwright WebKit 27.2（iPad プ�
 > Chrome 157 のみ正式対応で、WebKit は未出荷（実装作業の痕跡はあるが、Safari に載る時期は不明）。
 > → **見た目の差の本体である ①〜④ は iPad でもすべて実現できる**（WebGL2 + float 描画は WebKit で確認済み）。
 > ⑤「UI ごと歪ませる」が必要なら 4-5 の「疑似 HTML-in-Canvas」方式を使う。
+
+---
+
+## ★ 今回のタスク: 波紋がオブジェクトに当たった時の「虹」と「揺れ」
+
+### T-0. 用語 — 「揺れ」には 2 種類ある。両方を確認する
+
+| 種類 | 対象 | 見え方 | 仕組み |
+|---|---|---|---|
+| **A. 屈折の揺れ + 虹** | 水の**下**にあるもの（池の底・鯉・沈んだ物・UI カード等） | 波が通過する間、物体の像がぐにゃっと歪み、輪郭に赤〜青のにじみ | 水面パスが「物体を含む下の絵」を勾配だけずらして読む。R/G/B でずらし量を変える（3-2 の WATER パス） |
+| **B. 浮遊物の揺れ** | 水面に**浮いて**いるもの（蓮の葉・落ち葉・花びら・コイン等） | 波が来ると押し流され、傾き、山で少し持ち上がる（形は崩れない） | 物体の**中心 1 点**の高さ・勾配を読み、物体全体を剛体として平行移動・回転・拡大（T-3） |
+
+### T-1. 診断 — 原因は下のどれか（コードを読み、各項目 YES/NO と `file:line` を報告）
+
+まずアプリに **デバッグ表示を 2 つ足す**（reference.html の `uDebug` と同じ。URL クエリか隠しキーで切替）:
+- `debug=scene`: 水面パス直前の「下の絵」だけを表示
+- `debug=height`: 高さ場をグレースケール表示（`0.5 + h * 2.0`）
+
+| # | 原因 | 確かめ方 | 直し方 |
+|---|---|---|---|
+| **C1** | **物体が水面パスの「後」に描かれている／DOM・別 canvas・別レイヤーで上に重なっている**（最有力） | `debug=scene` に物体が**写っていない** → 屈折の材料に入っていない。または DevTools の Elements で物体が canvas の外の DOM・兄弟要素 | 物体を **scene のレンダーターゲットに描いてから** 水面パスを通す（T-2）。DOM の物体は画像化して scene に描き、操作が必要なら透明 DOM を重ねる（4-5） |
+| **C2** | 物体は自分のシェーダー／`drawImage` で描かれ、**水面の勾配を参照していない** | 物体の描画コードに高さテクスチャ（state）を読む処理がない | C1 と同じく scene に統合するのが最短。統合できない構成なら、物体側のシェーダーで画面 UV の勾配を読んでずらす（T-2 の別解） |
+| **C3** | 屈折はしているが **R/G/B が同じずれ量**（虹だけ出ない） | 水面シェーダーで `texture(uScene, uv + off)` を 1 回だけ読んでいる、または `dispersion` が 0 | チャネル別に 3 回サンプリング（3-2）。`dispersion` 0.25〜0.4 |
+| **C4** | ずれ量が小さすぎて見えない | `refraction` が小さい（0.02 未満）、または勾配を「1 セル差」ではなく画面 px 単位の差で割って極小になっている | 0.04〜0.08 から調整。勾配は sim の隣接セル差（`hR - hL`）をそのまま使う |
+| **C5** | **高さ場と下の絵で Y 軸が逆**（波紋と違う場所が歪む） | 画面下側をなぞると上側の物体が歪む。`debug=height` の波の位置と指の位置がずれる | `clientY` → UV の変換で `1 - y` を入れる／DOM 由来テクスチャは `1 - v` で読む（4-4 の 2） |
+| **C6** | 波が物体まで届いていない | `debug=height` で物体の位置に波が来ていない。物体の領域を障害物としてマスクしている／sim の範囲が画面の一部だけ | sim を画面全体に。物体を障害物にしたい場合でも、屈折の材料（scene）には入れる |
+| **C7** | 浮遊物を動かす処理がない／CPU で `readPixels` して毎フレーム固まる | 浮遊物の位置が固定値。または `readPixels` で 1 フレーム 10ms 以上かかる | T-3 の GPU 側で中心の高さを読む方式に |
+| **C8** | 物体テクスチャの縁が premultiplied alpha の不一致で黒く縁取られ、虹が濁る | 物体の縁に黒い輪郭 | アップロード時の `UNPACK_PREMULTIPLY_ALPHA_WEBGL` と合成式（`mix(col, c.rgb, c.a)` は非 premultiplied 前提）を揃える |
+
+**報告して方針の承認を取ってから** T-2 以降に進む。
+
+### T-2. 屈折の揺れ + 虹（A）を物体に効かせる
+
+**原則: 物体を「下の絵（scene）」に入れる。水面パスは 1 回だけで、画面全体（物体を含む）を屈折させる。**
+
+```
+誤: 背景 → 水面パス（屈折）→ 画面 ← 物体を上から描く   … 物体は歪まない（C1）
+正: 背景 → 物体 → sceneRT  ─→ 水面パス（屈折＋虹）→ 画面
+```
+
+- 生 WebGL: 物体の描画先を `scene.fb` に変える（reference.html の `drawScene` に物体の描画を足すイメージ）
+- three.js: 物体を含むシーンを `WebGLRenderTarget` に `renderer.render(scene, camera)` → その `texture` を水面の `ShaderMaterial` の `uScene` に渡し、全画面 quad で描く。EffectComposer なら水面を ShaderPass にして物体の RenderPass の後に置く
+- Canvas2D で物体を描いている: 物体を描いた 2D canvas を毎フレーム（または変化時のみ）`texImage2D` で scene テクスチャとして渡す
+- DOM / `<img>` の物体: 画像として scene に描き、DOM 側は `opacity: 0`（操作が要る場合）か削除
+
+**別解（scene に統合できない場合のみ）**: 物体ごとのシェーダーで、自分のピクセルの画面 UV（`gl_FragCoord.xy / uResolution`）で高さ場の勾配を読み、自分のテクスチャ UV を `-grad * refraction` だけ（R/B は `±dispersion` 倍して）ずらす。物体の外にはみ出せないので水面パス方式より弱い。
+
+### T-3. 浮遊物の揺れ（B）
+
+reference.html の `floatingLily`（SCENE シェーダー）がそのまま実装例:
+
+```glsl
+// 物体の中心 1 点で高さと勾配を読む（勾配は 4 セル幅で取り、細かい波でガタつかせない）
+vec3 s = surfaceAt(centerUv);                 // (h, dh/dx, dh/dy)
+vec2  pos   = center - s.yz * uBob;           // 斜面を下る向きに押し流される
+float scale = 1.0 + s.x * uBobScale;          // 波の山で持ち上がって大きく見える
+float rot   = baseRot + s.y * uBobTilt;       // 勾配で傾く
+```
+
+- three.js / スプライトなど頂点で描く物体: 上の 3 値を**頂点シェーダー**で計算（WebGL2 は頂点シェーダーで `texture()` 可）。CPU に読み戻さない
+- 物体の数が多く CPU で位置を管理したい場合: 小さな縮小テクスチャ（例 32×32）にだけ `readPixels` し、**1〜2 フレーム遅れて使う**（同期読み戻しで毎フレーム固めない）
+- 押し流した位置を元に戻すばねを付けると自然（`pos = mix(pos, home, 0.02)` 相当を CPU 側で）
+- 浮遊物の縁にも虹を出したいなら、浮遊物も scene に入れて水面パスを通す（reference.html は蓮を scene 内で動かしているので両方かかる）
+
+調整パラメータ（reference.html の既定。URL クエリで上書きして試せる）: `bob 0.35` / `bobScale 0.06` / `bobTilt 2.0`
+
+### T-4. 検証 — 数値で判定する（目視だけで完了にしない）
+
+0. 実行場所: このリポジトリのルート（`docs/water-ripple/` を社用アプリのリポジトリに複製した場合はそのルート）。スクリプトは実行場所の `node_modules` から `playwright` / `pngjs` を解決する
+1. 判定関数の単体テスト: `node --test docs/water-ripple/verify-object.test.mjs`（7 件 pass が基準）
+2. **先に reference.html で判定ツールが正しく動くことを確認**（社用 PC の環境差の切り分け）:
+   ```bash
+   npm i -D playwright pngjs && npx playwright install webkit
+   R="file://$PWD/docs/water-ripple/reference.html?idleDropMs=0"
+   node docs/water-ripple/verify-object.mjs "$R" 437,322,320,190 webkit ./obj-ref                  # カード → wobble:true, rainbow:true
+   node docs/water-ripple/verify-object.mjs "$R&dispersion=0" 437,322,320,190 webkit ./obj-ref2    # → wobble:true, rainbow:false
+   node docs/water-ripple/verify-object.mjs "$R" 935,508,184,184 webkit ./obj-ref3                 # 蓮 → wobble:true
+   ```
+3. 社用アプリで、**修正前に**対象オブジェクトの矩形（`getBoundingClientRect()`、iPad Pro 11 横 = 1194×834 の CSS px）を測って同じコマンドを実行 → `wobble:false` / `rainbow:false` になることを確認（= 不具合の再現。RED）
+4. 修正後に再実行 → `wobble:true`、無彩色の物体では `rainbow:true`（GREEN）
+5. `obj-shots/A0-before.png` と `A1-after.png` を Read して、歪み・虹・浮遊物の移動を目視でも確認
+
+**判定の注意**:
+- アイドル演出（自動の雫・泳ぐ魚など）は差分に混ざる → 検証中は止める（reference.html は `?idleDropMs=0`）
+- **虹の判定は白・灰・黒などの無彩色の物体でのみ有効**。色付きの物体（緑の蓮など）は物体自身の色差が混ざり、色収差を切っても `rainbow:true` と出る（較正で確認済み）。色付きの物体は `wobble` だけ見て、虹は UI カードや一時的に置いた白いテストパッチで確認する
+
+**較正結果**（reference.html、WebKit iPad Pro 11 / Chrome 157、2026-11-09）:
+
+| 状態 | motion | fringeRatio | 判定 |
+|---|---|---|---|
+| カード: 正常 | 20.6〜29.2 | 0.84〜0.86 | 揺れ○ 虹○ |
+| カード: 色収差なし（C3 相当） | 20.6〜29.6 | 0.16〜0.17 | 揺れ○ 虹× |
+| カード: 屈折対象外・ハイライトのみ通過（C1 相当） | 2.7〜4.1 | 0.30〜0.37 | 揺れ× 虹× |
+| 蓮: 正常（屈折＋浮遊） | 23〜26 | 0.6 前後 | 揺れ○ |
+| 蓮: 屈折も浮遊もなし | 0〜7.9 | — | 揺れ× |
+
+しきい値: `motion ≥ 10` で揺れ、さらに `fringeRatio ≥ 0.4` で虹。
+
+### T-5. 完了条件
+
+- [ ] T-1 の診断報告（原因 C1〜C8 の該当と `file:line`）
+- [ ] 修正前に `verify-object.mjs` で不具合を再現（RED）→ 修正後に判定が反転（GREEN）。対象: 水中の無彩色物体 1 つ以上、浮遊物 1 つ以上
+- [ ] `verify.mjs ... webkit` で `errors: []`、canvas が画面サイズ × DPR
+- [ ] iPad 実機の Kiosk Pro で、物体に波が当たった時に歪み・虹・浮遊物の揺れが見えること（5-3 のチェックも）
+- [ ] 60fps を維持（物体を scene に入れたことで重くなっていないか。重ければ `maxDpr` を 1.5 に）
 
 ---
 

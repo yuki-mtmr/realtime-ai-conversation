@@ -34,7 +34,7 @@
 'use strict';
 
 // ---------- 調整パラメータ（ここだけ触れば見た目が変わる） ----------
-const PARAMS = Object.freeze({
+const DEFAULTS = Object.freeze({
   simLongSide: 384,      // シミュレーション格子の長辺セル数（256〜512）
   damping: 0.992,        // 速度の減衰（1 に近いほど長く残る）
   dropRadiusPx: 18,      // 指 1 本ぶんの半径（CSS px）
@@ -46,7 +46,19 @@ const PARAMS = Object.freeze({
   stepHz: 60,            // 固定タイムステップ（120Hz 端末でも速さを揃える）
   idleDropMs: 1400,      // 何もしなくても時々落ちる雫（0 で無効）
   maxDpr: 2,             // 描画解像度の上限（古い iPad で重ければ 1.5 に）
+  bob: 0.35,             // 浮遊物（蓮）が波で押し流される量
+  bobScale: 0.06,        // 浮遊物が波の山で持ち上がって見える拡大率
+  bobTilt: 2.0,          // 浮遊物の傾き（回転）量
 });
+// URL クエリで数値パラメータを上書き（検証・較正用）。例: ?dispersion=0&idleDropMs=0
+const QUERY = new URLSearchParams(location.search);
+const PARAMS = Object.freeze(Object.fromEntries(Object.entries(DEFAULTS).map(([k, v]) => {
+  const n = Number(QUERY.get(k));
+  return [k, QUERY.has(k) && Number.isFinite(n) ? n : v];
+})));
+// ?debug=scene → 屈折前の「下の世界」だけ表示（オブジェクトがここに無ければ屈折対象外）
+// ?debug=height → 高さ場を表示（波がオブジェクトの位置まで届いているか）
+const DEBUG = { scene: 1, height: 2 }[QUERY.get('debug')] ?? 0;
 
 const canvas = document.getElementById('gl');
 const card = document.getElementById('card');
@@ -112,6 +124,7 @@ precision highp float;
 in vec2 vUv; out vec4 o;
 uniform float uAspectX; uniform float uTime;
 uniform sampler2D uCard; uniform vec4 uCardRect; uniform float uHasCard;
+uniform sampler2D uState; uniform vec2 uTexel; uniform float uBob; uniform float uBobScale; uniform float uBobTilt;
 float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
 float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
   return mix(mix(hash(i), hash(i + vec2(1,0)), u.x), mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), u.x), u.y); }
@@ -127,6 +140,21 @@ vec3 lily(vec2 p, vec2 c, float r, float rot, vec3 col){
   g *= 0.85 + 0.25 * (len / r);
   return mix(col, g, m);
 }
+// 浮遊物: 物体の「中心 1 点」の高さと勾配を読み、物体全体を剛体として動かす（押し流し・持ち上がり・傾き）
+// 勾配は 4 セル幅で取って細かい波でガタつかないようにする
+vec3 surfaceAt(vec2 uv){
+  vec2 t = uTexel * 4.0;
+  float h = texture(uState, uv).r;
+  float gx = texture(uState, uv + vec2(t.x, 0.0)).r - texture(uState, uv - vec2(t.x, 0.0)).r;
+  float gy = texture(uState, uv + vec2(0.0, t.y)).r - texture(uState, uv - vec2(0.0, t.y)).r;
+  return vec3(h, gx, gy);
+}
+vec3 floatingLily(vec2 p, vec2 c, float r, float rot, vec3 col){
+  vec3 s = surfaceAt(c / vec2(uAspectX, 1.0));
+  vec2 cc = c - s.yz * uBob;            // 波の斜面を下る向きに押される
+  float rr = r * (1.0 + s.x * uBobScale); // 山で持ち上がって大きく見える
+  return lily(p, cc, rr, rot + s.y * uBobTilt, col);
+}
 void main(){
   vec2 p = vUv * vec2(uAspectX, 1.0);
   vec3 col = mix(vec3(0.03, 0.15, 0.13), vec3(0.08, 0.30, 0.26), fbm(p * 2.2 + uTime * 0.01));
@@ -135,9 +163,9 @@ void main(){
   float pr = 0.10 + 0.16 * hash(id + 3.3);
   float pebble = smoothstep(pr, pr - 0.12, length(f - jit * 0.5)) * step(0.72, hash(id + 1.7));
   col = mix(col, vec3(0.02, 0.09, 0.08), pebble * 0.55);
-  col = lily(p, vec2(0.18 * uAspectX, 0.82), 0.085, 0.8, col);
-  col = lily(p, vec2(0.86 * uAspectX, 0.28), 0.11, 2.4, col);
-  col = lily(p, vec2(0.72 * uAspectX, 0.08), 0.07, -1.2, col);
+  col = floatingLily(p, vec2(0.18 * uAspectX, 0.82), 0.085, 0.8, col);
+  col = floatingLily(p, vec2(0.86 * uAspectX, 0.28), 0.11, 2.4, col);
+  col = floatingLily(p, vec2(0.72 * uAspectX, 0.08), 0.07, -1.2, col);
   if (uHasCard > 0.5) {
     vec2 cuv = (vUv - uCardRect.xy) / (uCardRect.zw - uCardRect.xy);
     if (all(greaterThanEqual(cuv, vec2(0.0))) && all(lessThanEqual(cuv, vec2(1.0)))) {
@@ -154,8 +182,11 @@ precision highp float;
 in vec2 vUv; out vec4 o;
 uniform sampler2D uState; uniform sampler2D uScene; uniform vec2 uTexel;
 uniform float uRefraction; uniform float uDispersion; uniform float uCaustics; uniform float uSpecular;
+uniform int uDebug;
 void main(){
   float hC = texture(uState, vUv).r;
+  if (uDebug == 1) { o = vec4(texture(uScene, vUv).rgb, 1.0); return; }
+  if (uDebug == 2) { o = vec4(vec3(0.5 + hC * 2.0), 1.0); return; }
   float hL = texture(uState, vUv - vec2(uTexel.x, 0.0)).r;
   float hR = texture(uState, vUv + vec2(uTexel.x, 0.0)).r;
   float hD = texture(uState, vUv - vec2(0.0, uTexel.y)).r;
@@ -341,8 +372,13 @@ function stepSim() {
   gl.drawArrays(gl.TRIANGLES, 0, 3); swap();
 }
 function drawScene(t) {
-  bindQuad(P.scene, scene); tex(1, cardTex);
+  bindQuad(P.scene, scene); tex(1, cardTex); tex(2, state.a.tex);
   gl.uniform1i(P.scene.u.uCard, 1);
+  gl.uniform1i(P.scene.u.uState, 2);
+  gl.uniform2f(P.scene.u.uTexel, 1 / state.w, 1 / state.h);
+  gl.uniform1f(P.scene.u.uBob, PARAMS.bob);
+  gl.uniform1f(P.scene.u.uBobScale, PARAMS.bobScale);
+  gl.uniform1f(P.scene.u.uBobTilt, PARAMS.bobTilt);
   gl.uniform1f(P.scene.u.uAspectX, canvas.width / canvas.height);
   gl.uniform1f(P.scene.u.uTime, t / 1000);
   gl.uniform4f(P.scene.u.uCardRect, ...cardRect);
@@ -357,6 +393,7 @@ function drawWater() {
   gl.uniform1f(P.water.u.uDispersion, PARAMS.dispersion);
   gl.uniform1f(P.water.u.uCaustics, PARAMS.caustics);
   gl.uniform1f(P.water.u.uSpecular, PARAMS.specular);
+  gl.uniform1i(P.water.u.uDebug, DEBUG);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
