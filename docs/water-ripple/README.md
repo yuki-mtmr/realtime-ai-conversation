@@ -10,9 +10,18 @@
 | `verify.mjs` | Playwright で「ドラッグ → スクショ → 入力可否 → console error」を自動確認 |
 | `expected-chrome157.png` | Chrome 157 での期待画像（HTML カードが屈折・色収差で歪み、入力欄に実際に入力できている） |
 | `expected-fallback.png` | HTML-in-Canvas 非対応ブラウザ（Chrome 156）での期待画像（カードは静止画として歪む） |
+| `expected-webkit-ipad.png` | Playwright WebKit（iPad Pro 11 プロファイル）での期待画像 = **本番の iPad / Kiosk Pro に最も近い** |
 
 検証済み環境（2026-11-09, macOS / Apple Silicon）: Chrome 157.0.8103.26 で HTML-in-Canvas 経路、
-Chrome for Testing 156 で fallback 経路。両方で console error 0、Chrome 157 では入力欄へのフォーカスと入力 `hello` を確認済み。
+Chrome for Testing 156 で fallback 経路、Playwright WebKit 27.2（iPad プロファイル）で fallback 経路。
+すべて console error 0。Chrome 157 では入力欄へのフォーカスと入力 `hello` を確認済み。
+**iPad 実機・Kiosk Pro 上では未検証**（5-3 の手動チェックで確認すること）。
+
+> ### ⚠ 本番環境は iPad + Kiosk Pro（= WebKit）。HTML-in-Canvas は使えない前提で作る
+> Kiosk Pro は Apple の WKWebView（Safari と同じ WebKit エンジン）で表示する。HTML-in-Canvas は 2026-11-09 時点で
+> Chrome 157 のみ正式対応で、WebKit は未出荷（実装作業の痕跡はあるが、Safari に載る時期は不明）。
+> → **見た目の差の本体である ①〜④ は iPad でもすべて実現できる**（WebGL2 + float 描画は WebKit で確認済み）。
+> ⑤「UI ごと歪ませる」が必要なら 4-5 の「疑似 HTML-in-Canvas」方式を使う。
 
 ---
 
@@ -30,8 +39,8 @@ Chrome for Testing 156 で fallback 経路。両方で console error 0、Chrome 
 2. 波は広がって減衰し、画面端で反射する。120Hz 端末でも 60Hz 端末でも速さが同じ
 3. 波の下の絵（背景・UI）が屈折で歪み、RGB がわずかにずれて虹色のにじみが出る
 4. HTML-in-Canvas 対応 Chrome では、歪んだカードの入力欄をクリック → 入力できる。フォーカスリングも出る
-5. 非対応ブラウザでもエラーにならず fallback 表示になる
-6. モバイルでなぞってもページがスクロールしない（`touch-action: none`）
+5. 非対応ブラウザ（**本番の iPad / Kiosk Pro を含む**）でもエラーにならず、①〜④ の質感が出る
+6. iPad でなぞってもページがスクロールせず、長押ししても選択ハイライト・コピーメニューが出ない
 7. `verify.mjs` の出力で `errors: []`。`1-drag.png` が `expected-*.png` と同等の質感
 
 ---
@@ -212,7 +221,32 @@ canvas.updateElementGeometry(card, { canvasTransform: new DOMMatrix().translate(
 4. 屈折で見た目は揺れるが、ヒットテストは `updateElementGeometry` で渡した歪む前の矩形で行われる（実用上は問題なし）
 5. canvas グリッドはデバイスピクセルに合わせる: `ResizeObserver` で `{ box: 'device-pixel-content-box' }` を observe し、`devicePixelContentBoxSize` から `canvas.width/height` を設定。サイズ変更後は `requestPaint()`
 
-### 4-5. セキュリティ・プライバシー上の制約（仕様）
+### 4-5. iPad / Kiosk Pro（WebKit）向け — 本番はこちら
+
+**WebKit で実際に踏んだ問題（reference.html は修正済み）**:
+
+1. **`ResizeObserver` の `{ box: 'device-pixel-content-box' }` に WebKit は非対応で、`observe()` が `TypeError` を投げる**
+   → canvas が 300×150 のまま何も描かれない。`try { ro.observe(c, {box:'device-pixel-content-box'}) } catch { ro.observe(c) }` とし、
+   サイズは `contentRect × devicePixelRatio` で計算する
+2. **なぞる操作でテキスト選択が始まり、選択ハイライト（半透明の青）が canvas 全体に被る**（画面が青白く濁る。シェーダーの不具合に見えるので注意）
+   → `body { -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; -webkit-tap-highlight-color:transparent }`、
+   入力欄だけ `user-select:text` に戻す。水面上の `pointerdown` で `preventDefault()`
+3. iPad の DPR は 2 なので、全画面パス（scene / water）は 2388×1668 程度になる。重ければ `PARAMS.maxDpr` を 1.5 に下げる（sim 解像度は別なので波の質は落ちない）
+
+**UI（フォーム等）も歪ませたい場合 — 疑似 HTML-in-Canvas 方式**（HTML-in-Canvas 無しで ⑤ を近似する）:
+
+- UI の見た目を Canvas2D で描いてテクスチャ化 → SCENE パスに合成（reference.html の `uploadCardFallback` と同じ）
+- 操作用に **本物の DOM を同じ位置に `opacity: 0` で重ねる**（入力・タップは DOM が受ける）
+- `input` / `focus` / `blur` イベントで Canvas2D を描き直して `texImage2D` で再アップロード（キャレットは自前描画、点滅は 530ms 程度）
+- iPad のソフトキーボード表示でビューポートが変わるので `visualViewport` の resize で位置を再計算
+- UI が多い／頻繁に変わる場合は割に合わない → **UI は水面の上に普通の DOM として載せ、歪ませるのは背景だけ**にするのが現実解。デモの見た目の大部分は ①〜④ で出る
+
+**Kiosk Pro 側の設定・確認**:
+- ブラウザエンジンが **WKWebView**（既定）になっていること。旧 UIWebView 設定だと WebGL2 等の挙動が異なる可能性がある
+- デバッグは Kiosk Pro の「Web Inspector を有効化」設定 + Mac の Safari「開発」メニューから接続して console を見る
+- iPadOS のバージョンを記録しておく（WebGL2 / `EXT_color_buffer_float` / `getCoalescedEvents` の可否が OS 依存。reference.html は後者 2 つが無くても動くよう分岐済み）
+
+### 4-6. セキュリティ・プライバシー上の制約（仕様）
 
 クロスオリジンの画像・iframe 内容、`:visited` 情報、スペルチェックの波線、オートフィル候補、IME ポップアップ、システムカラーなどはテクスチャに描かれない。
 → カード内に外部ドメインの画像を置くと空白になる。同一オリジンから配信する。
@@ -237,15 +271,22 @@ GL に依存しない純粋関数を切り出してテストする（vitest / je
 
 ```bash
 npm i -D playwright
-node docs/water-ripple/verify.mjs http://localhost:<port>/<波紋のページ> ./ripple-shots
+npx playwright install webkit
+# 本番相当（iPad / WebKit）— こちらを主に見る
+node docs/water-ripple/verify.mjs http://localhost:<port>/<波紋のページ> ./ripple-shots-webkit webkit
+# 参考（Chrome 157, HTML-in-Canvas 経路）
+node docs/water-ripple/verify.mjs http://localhost:<port>/<波紋のページ> ./ripple-shots-chrome chrome
 ```
-- 出力 JSON: `htmlInCanvas`（Chrome 157 なら true）、`focused.value === "hello"`（HTML-in-Canvas 版のみ）、`errors: []`
-- `ripple-shots/1-drag.png` を Read して `expected-chrome157.png` / `expected-fallback.png` と比較し、受け入れ基準 1〜3 を目視判定
+- 出力 JSON: `errors: []`、`canvasPx` が画面サイズ × DPR になっている（`[300,150]` なら ResizeObserver で落ちている）
+- `htmlInCanvas` は Chrome 157 なら true、WebKit なら false が正常。`focused.value === "hello"` は HTML-in-Canvas 版のみ
+- `1-drag.png` を Read して `expected-webkit-ipad.png`（WebKit）/ `expected-chrome157.png`（Chrome）と比較し、受け入れ基準 1〜3 を目視判定。**画面が青白く濁っていたら選択ハイライト（4-5 の 2）**
 - 比較の前に、まず `reference.html` 自体を同じスクリプトで回して、社用 PC の環境で期待画像が再現できることを確認する（環境差の切り分け）
 
-### 5-3. 実機（手動チェック）
+### 5-3. 実機（手動チェック）— 本番の iPad + Kiosk Pro で
 
-- [ ] スマホ実機でなぞる → スクロールしない、軌跡が途切れない
+- [ ] iPad 実機の Kiosk Pro でなぞる → スクロールしない、軌跡が途切れない、2 本指・3 本指でも破綻しない
+- [ ] 長押し・ダブルタップで選択ハイライト／コピーメニュー／ズームが出ない
+- [ ] 数十分放置・連続操作してもフレーム落ち・発熱で破綻しない（キオスクは長時間稼働）
 - [ ] 120Hz 端末（ProMotion 等）と 60Hz で波の速さが同じ
 - [ ] ウィンドウのリサイズ・回転後もぼやけない／カード位置とクリック位置がずれない
 - [ ] DevTools Performance で 1 フレーム 16ms 未満（重ければ `simLongSide` を 256 に）

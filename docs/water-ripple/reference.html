@@ -6,6 +6,9 @@
 <title>Water Ripple Reference</title>
 <style>
   html, body { margin: 0; height: 100%; background: #0b2a26; overflow: hidden; }
+  /* なぞる操作でテキスト選択ハイライト（WebKit で画面全体が青く被る）・長押しメニュー・タップ強調を出さない */
+  body { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  #card input { -webkit-user-select: text; user-select: text; }
   #gl { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; }
   #card { box-sizing: border-box; width: 320px; padding: 20px; border-radius: 16px;
           background: #e8f7f2; color: #123; font: 14px/1.5 system-ui, sans-serif; }
@@ -42,6 +45,7 @@ const PARAMS = Object.freeze({
   specular: 0.5,         // ハイライト強度
   stepHz: 60,            // 固定タイムステップ（120Hz 端末でも速さを揃える）
   idleDropMs: 1400,      // 何もしなくても時々落ちる雫（0 で無効）
+  maxDpr: 2,             // 描画解像度の上限（古い iPad で重ければ 1.5 に）
 });
 
 const canvas = document.getElementById('gl');
@@ -296,7 +300,11 @@ function toUv(e) {
   return [(e.clientX - r.left) / r.width, 1 - (e.clientY - r.top) / r.height];
 }
 function pushSegment(a, b) { if (pendingSegments.length < 64) pendingSegments.push([a, b]); }
-canvas.addEventListener('pointerdown', (e) => { last = toUv(e); pushSegment(last, last); });
+canvas.addEventListener('pointerdown', (e) => {
+  // カード内（入力欄・ボタン）はブラウザ既定動作を残す。水面部分のみ選択開始を抑止
+  if (e.target === canvas) e.preventDefault();
+  last = toUv(e); pushSegment(last, last);
+});
 canvas.addEventListener('pointermove', (e) => {
   if (e.pointerType === 'mouse' && e.buttons === 0) { last = null; return; } // マウスは押下中のみ
   const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];        // 高頻度サンプルで軌跡を滑らかに
@@ -373,13 +381,19 @@ function resizeTo(w, h) {
   allocate();
   if (!HIC) uploadCardFallback();
 }
-new ResizeObserver(([entry]) => {
+// iPad など高 DPR 端末で画面解像度パス（scene/water）が重い場合の上限
+const dpr = () => Math.min(devicePixelRatio, PARAMS.maxDpr);
+const ro = new ResizeObserver(([entry]) => {
   const s = entry.devicePixelContentBoxSize?.[0];
-  const w = s ? s.inlineSize : Math.round(entry.contentRect.width * devicePixelRatio);
-  const h = s ? s.blockSize : Math.round(entry.contentRect.height * devicePixelRatio);
+  const exact = s && dpr() === devicePixelRatio;
+  const w = exact ? s.inlineSize : Math.round(entry.contentRect.width * dpr());
+  const h = exact ? s.blockSize : Math.round(entry.contentRect.height * dpr());
   resizeTo(w, h);
   if (HIC) canvas.requestPaint();
-}).observe(canvas, { box: 'device-pixel-content-box' });
+});
+// WebKit (Safari / iPad WKWebView) は 'device-pixel-content-box' 非対応で observe() が TypeError を投げる
+try { ro.observe(canvas, { box: 'device-pixel-content-box' }); }
+catch { ro.observe(canvas); }
 
 if (HIC) {
   // paint イベント内の描画は同フレームに反映される。毎回 requestPaint で連続アニメーション
