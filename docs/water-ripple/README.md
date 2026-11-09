@@ -2,21 +2,26 @@
 
 > **この文書の使い方**: 社用 PC の Claude Code に、このフォルダごと読ませて
 > 「`docs/water-ripple/README.md` の指示に従って、既存の波紋実装を診断・修正・検証して」と依頼する。
-> 同じフォルダに **動作確認済みのリファレンス実装** と **検証スクリプト** と **期待画像** がある。
+> 同じフォルダに **動作確認済みのリファレンス実装**、**検証スクリプト**、**目で見る参照画像（`images/`）** がある。
+> 外部サイト（X の元動画など）は社用 PC から見られない前提。**目標の質感はすべて `images/` の画像で定義する。**
 >
-> **現在のタスクは「★ 今回のタスク」節（すぐ下）。** 波紋そのものは実装済みで、
-> **波紋がオブジェクトに当たった時の「虹（色収差）」と「揺れ」が出ていない**のを直す。
+> **現在のタスク（優先順）**
+> 1. **「◆ 質感の合わせ込み」節** — 波の質感が参照に届いていない。参照画像と同条件で撮って並べ、ずれを特定して直す
+> 2. **「★ オブジェクトの虹と揺れ」節** — 波紋がオブジェクトに当たった時の虹（色収差）と揺れ
+>
 > 0 章以降は背景知識・共通リファレンスとして必要な時に参照する。
 
 | ファイル | 中身 |
 |---|---|
-| `reference.html` | 単一ファイルの完成形（WebGL2）。ブラウザで開くだけで動く。指/マウスでなぞると波紋。蓮は波で押し流され・傾き・持ち上がる（浮遊物の揺れ）。`?debug=scene` / `?debug=height` / `?<パラメータ名>=<数値>` 対応 |
-| `verify-object.mjs` | **今回の判定ツール**。指定矩形のオブジェクトを波が横切った時の「揺れ」「虹」を数値で判定（しきい値は較正済み） |
-| `verify-object.test.mjs` | 上の判定関数の単体テスト（`node --test`） |
-| `verify.mjs` | Playwright で「ドラッグ → スクショ → 入力可否 → console error」を自動確認 |
-| `expected-chrome157.png` | Chrome 157 での期待画像（HTML カードが屈折・色収差で歪み、入力欄に実際に入力できている） |
-| `expected-fallback.png` | HTML-in-Canvas 非対応ブラウザ（Chrome 156）での期待画像（カードは静止画として歪む） |
-| `expected-webkit-ipad.png` | Playwright WebKit（iPad Pro 11 プロファイル）での期待画像 = **本番の iPad / Kiosk Pro に最も近い** |
+| `images/frames.jpg` | **目標の質感（時系列）**。reference.html を iPad 相当（WebKit, 1194×834, DPR 2）でなぞり、+100/400/900/1600/3000ms を並べたもの |
+| `images/detail.png` | **目標の質感（等倍）**。+400ms をデバイスピクセル等倍で 3 か所（なぞった線の始点・中央・終点）切り出し |
+| `images/gallery.jpg` | **失敗例ギャラリー**。OK と、典型的なずれ 6 種（筋・粒／虹なし／歪み弱い／のっぺり／すぐ消える／荒れ）を同条件で並べたもの |
+| `images/chrome157-html-in-canvas.png` | 参考: Chrome 157 の HTML-in-Canvas 経路（歪んだカードに実際に入力できている） |
+| `reference.html` | 単一ファイルの完成形（WebGL2）。ブラウザで開くだけで動く。`?debug=scene` / `?debug=height` / `?<パラメータ名>=<数値>` 対応 |
+| `capture-sheet.mjs` | **質感の撮影ツール**。任意の URL を参照画像と同じなぞり方・同じ時刻・同じ切り出しで撮る |
+| `make-gallery.mjs` | `images/gallery.jpg` の生成スクリプト（作り方の記録） |
+| `verify-object.mjs` / `.test.mjs` | オブジェクトの「揺れ」「虹」を数値判定（しきい値は較正済み）とその単体テスト |
+| `verify.mjs` | 「ドラッグ → スクショ → 入力可否 → console error」の自動確認 |
 
 検証済み環境（2026-11-09, macOS / Apple Silicon）: Chrome 157.0.8103.26 で HTML-in-Canvas 経路、
 Chrome for Testing 156 で fallback 経路、Playwright WebKit 27.2（iPad プロファイル）で fallback 経路。
@@ -31,7 +36,68 @@ Chrome for Testing 156 で fallback 経路、Playwright WebKit 27.2（iPad プ�
 
 ---
 
-## ★ 今回のタスク: 波紋がオブジェクトに当たった時の「虹」と「揺れ」
+## ◆ 質感の合わせ込み（目で見る参照あり）
+
+### Q-0. まず参照画像を Read して、目標の質感を言葉にする
+
+`images/frames.jpg` → `images/detail.png` → `images/gallery.jpg` の順に Read する。目標の質感の特徴:
+
+| 観点 | 目標（`frames.jpg` / `detail.png`） |
+|---|---|
+| 波の形 | なぞった軌跡に沿って **太くなめらかなうねり**が 2 本の帯のように左右へ広がる。軌跡の上に細い平行線（はしご状の筋）は**出ない** |
+| 輪 | 始点に同心円。輪の間隔は数十 px（等倍で 20〜40 px）で、輪郭は柔らかい |
+| ハイライト | 波頭に沿った**細い連続した白線**。点々と散る粒・四角いブロックは**出ない** |
+| 歪み | カードの文字が「波打つ」程度に大きく歪む（`detail.png` 中央）。文字が読めなくなるほどではない |
+| 虹 | 歪んだ輪郭に沿って赤〜黄〜青の帯。**白地と濃色の境目で太く**出る |
+| 時間変化 | +100〜400ms が最も強く、+1600ms で画面全体に薄く広がり、+3000ms でほぼ静まる（端で反射した弱い波が残る程度） |
+
+### Q-1. 社用アプリを同じ条件で撮る
+
+```bash
+npm i -D playwright pngjs && npx playwright install webkit
+# 参照（環境差の確認。images/ と同じ見た目になること）
+node docs/water-ripple/capture-sheet.mjs "file://$PWD/docs/water-ripple/reference.html?idleDropMs=0" ./sheet-ref webkit reference
+# 社用アプリ（アイドル演出は止めて撮る）
+node docs/water-ripple/capture-sheet.mjs "http://localhost:<port>/<波紋のページ>" ./sheet-app webkit app
+```
+
+`sheet-app/frames.jpg` と `images/frames.jpg`、`sheet-app/detail.png` と `images/detail.png` を Read して並べて見る。
+`images/gallery.jpg` のどの行に似ているかで、ずれているパラメータを特定する:
+
+| 見え方（gallery の行） | 主な原因 | 直し方（reference.html の既定値へ寄せる） |
+|---|---|---|
+| はしご状の筋・粒状ハイライト | 格子が細かすぎ／粘性なし／注入が細く強い | `simLongSide` 256、`viscosity` 0.03 を追加（下記）、`dropRadiusPx` 26、`dropStrength` 0.6 |
+| 虹なし | R/G/B を同じ量ずらしている | チャネル別に 3 回サンプリング、`dispersion` 0.35 |
+| 歪みが弱い | 屈折量不足 | `refraction` 0.09 |
+| のっぺり | 集光・ハイライトなし | ラプラシアン集光 `caustics` 1.8、スペキュラ `specular` 0.5（指数 90） |
+| すぐ消える | 減衰が強い／固定タイムステップなしで速さが変わる | `damping` 0.992、固定 60Hz ステップ |
+| 荒れてブロック状 | 格子が粗すぎ | `simLongSide` 256（128 未満にしない） |
+| どれにも似ていない | 波の方式自体が違う（リングを描いている等） | 1 章の 5 要素で診断し、3 章のパイプラインに置換 |
+
+**粘性（viscosity）** — 今回の質感改善の要。波動方程式の更新に 1 行足す:
+```glsl
+s.g += (avg - s.r) * 2.0;
+s.g *= uDamping;
+s.r += s.g;
+s.r = mix(s.r, avg, uViscosity);   // ← 追加。0.03。格子スケールの細かい波を消してなめらかなうねりにする
+```
+
+### Q-2. 合わせ込みの進め方
+
+- **1 回に 1 パラメータだけ変える** → `capture-sheet.mjs` で撮り直す → 参照と並べて Read。複数同時に変えると何が効いたか分からなくなる
+- パラメータの単位が reference.html と違う場合がある（屈折量が px 単位、格子が固定サイズ等）。値をそのまま写さず、**見え方を参照に寄せる**
+- 「近づいた／離れた」を Q-0 の表の観点ごとに 1 行で記録して報告する
+- 最終確認は iPad 実機の Kiosk Pro（Playwright WebKit と実機で GPU が違うため、ハイライトの細かさ・速度は実機で見る）
+
+### Q-3. 完了条件
+
+- [ ] `sheet-app/frames.jpg` と `images/frames.jpg` を並べて、Q-0 の 6 観点すべてで「同等」と判断できる（観点ごとの判断理由を 1 行ずつ報告）
+- [ ] `sheet-app/detail.png` にはしご状の筋・粒状／ブロック状ハイライトが無い
+- [ ] iPad 実機で 60fps を維持
+
+---
+
+## ★ オブジェクトの虹と揺れ: 波紋がオブジェクトに当たった時
 
 ### T-0. 用語 — 「揺れ」には 2 種類ある。両方を確認する
 
@@ -136,9 +202,9 @@ float rot   = baseRot + s.y * uBobTilt;       // 勾配で傾く
 
 ---
 
-## 0. 目標とする見た目（参考: X @nickbakeddesign "html-in-canvas" 2026-10-29 の動画）
+## 0. 目標とする見た目（画像は `images/`。元ネタは X の動画だが社用 PC からは見られないので参照しない）
 
-- 鯉と蓮のある池の上に「Wishing pond」というフォームカードが浮かんでいる
+- 池の上に「Wishing pond」というフォームカードが浮かんでいる（元デモには鯉もいる）
 - 指でなぞると、**なぞった軌跡に沿って航跡が残り**、波が同心円状に広がって反射・干渉する
 - 波が通過すると **背景もカード上の文字・入力欄も屈折して歪む**。輪郭には **虹色のにじみ（色収差）**
 - 波の山に **白いハイライト（スペキュラ）**、集光した明るい筋（コースティクス）
@@ -152,7 +218,7 @@ float rot   = baseRot + s.y * uBobTilt;       // 勾配で傾く
 4. HTML-in-Canvas 対応 Chrome では、歪んだカードの入力欄をクリック → 入力できる。フォーカスリングも出る
 5. 非対応ブラウザ（**本番の iPad / Kiosk Pro を含む**）でもエラーにならず、①〜④ の質感が出る
 6. iPad でなぞってもページがスクロールせず、長押ししても選択ハイライト・コピーメニューが出ない
-7. `verify.mjs` の出力で `errors: []`。`1-drag.png` が `expected-*.png` と同等の質感
+7. `verify.mjs` の出力で `errors: []`。質感は「◆ 質感の合わせ込み」の Q-3 を満たす
 
 ---
 
@@ -237,6 +303,7 @@ float avg = 0.25 * (h(+x) + h(-x) + h(+y) + h(-y));  // 4 近傍の平均
 s.g += (avg - s.r) * 2.0;   // 平均との差で加速
 s.g *= uDamping;            // 0.99 前後。1 に近いほど長く残る
 s.r += s.g;
+s.r = mix(s.r, avg, uViscosity);  // 粘性 0.03。無いとはしご状の筋・粒状ハイライトが出る
 ```
 線分注入（なぞった跡を連続にする肝）:
 ```glsl
@@ -270,11 +337,12 @@ col += pow(max(dot(reflect(-L, n), vec3(0,0,1)), 0.0), 90.0) * uSpecular;
 
 | 名前 | 既定 | 効き方 |
 |---|---|---|
-| `simLongSide` | 384 | 格子の細かさ。上げると細かい波・重くなる |
+| `simLongSide` | 256 | 格子の細かさ。384 以上ははしご状の筋・粒状ハイライトが出やすい。128 未満は荒れる |
+| `viscosity` | 0.03 | 高さの平滑化。0 だと細かい筋が残る。上げすぎると波がすぐ溶ける |
 | `damping` | 0.992 | 波の残り時間 |
-| `dropRadiusPx` | 18 | 指の太さ（CSS px） |
-| `dropStrength` | 0.9 | 波の高さ |
-| `refraction` | 0.06 | 歪みの強さ（デモ級の肝。0.03〜0.1） |
+| `dropRadiusPx` | 26 | 指の太さ（CSS px） |
+| `dropStrength` | 0.6 | 波の高さ |
+| `refraction` | 0.09 | 歪みの強さ（デモ級の肝。0.06〜0.12） |
 | `dispersion` | 0.35 | 虹色のにじみ |
 | `caustics` / `specular` | 1.8 / 0.5 | 明るい筋 / 白いハイライト |
 
@@ -390,7 +458,7 @@ node docs/water-ripple/verify.mjs http://localhost:<port>/<波紋のページ> .
 ```
 - 出力 JSON: `errors: []`、`canvasPx` が画面サイズ × DPR になっている（`[300,150]` なら ResizeObserver で落ちている）
 - `htmlInCanvas` は Chrome 157 なら true、WebKit なら false が正常。`focused.value === "hello"` は HTML-in-Canvas 版のみ
-- `1-drag.png` を Read して `expected-webkit-ipad.png`（WebKit）/ `expected-chrome157.png`（Chrome）と比較し、受け入れ基準 1〜3 を目視判定。**画面が青白く濁っていたら選択ハイライト（4-5 の 2）**
+- 質感の比較は `verify.mjs` ではなく `capture-sheet.mjs`（「◆ 質感の合わせ込み」）で行う。**画面が青白く濁っていたら選択ハイライト（4-5 の 2）**
 - 比較の前に、まず `reference.html` 自体を同じスクリプトで回して、社用 PC の環境で期待画像が再現できることを確認する（環境差の切り分け）
 
 ### 5-3. 実機（手動チェック）— 本番の iPad + Kiosk Pro で
@@ -400,7 +468,7 @@ node docs/water-ripple/verify.mjs http://localhost:<port>/<波紋のページ> .
 - [ ] 数十分放置・連続操作してもフレーム落ち・発熱で破綻しない（キオスクは長時間稼働）
 - [ ] 120Hz 端末（ProMotion 等）と 60Hz で波の速さが同じ
 - [ ] ウィンドウのリサイズ・回転後もぼやけない／カード位置とクリック位置がずれない
-- [ ] DevTools Performance で 1 フレーム 16ms 未満（重ければ `simLongSide` を 256 に）
+- [ ] DevTools Performance で 1 フレーム 16ms 未満（重ければ `maxDpr` を 1.5 に）
 
 ---
 

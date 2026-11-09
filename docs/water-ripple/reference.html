@@ -35,11 +35,12 @@
 
 // ---------- 調整パラメータ（ここだけ触れば見た目が変わる） ----------
 const DEFAULTS = Object.freeze({
-  simLongSide: 384,      // シミュレーション格子の長辺セル数（256〜512）
+  simLongSide: 256,      // シミュレーション格子の長辺セル数。大きいほど細かい波（384 以上は筋・粒が出やすい）
   damping: 0.992,        // 速度の減衰（1 に近いほど長く残る）
-  dropRadiusPx: 18,      // 指 1 本ぶんの半径（CSS px）
-  dropStrength: 0.9,     // 1 区間あたりに足す高さ
-  refraction: 0.06,      // 高さ勾配 → UV ずれ量
+  viscosity: 0.03,       // 高さの平滑化（0〜0.1）。0 だとはしご状の筋・粒状ハイライトが出る
+  dropRadiusPx: 26,      // 指 1 本ぶんの半径（CSS px）
+  dropStrength: 0.6,     // 1 区間あたりに足す高さ
+  refraction: 0.09,      // 高さ勾配 → UV ずれ量
   dispersion: 0.35,      // RGB のずれ比（色収差）
   caustics: 1.8,         // ラプラシアン由来の集光の強さ
   specular: 0.5,         // ハイライト強度
@@ -105,7 +106,7 @@ void main(){
 const UPDATE_FS = `#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 o;
-uniform sampler2D uState; uniform vec2 uTexel; uniform float uDamping;
+uniform sampler2D uState; uniform vec2 uTexel; uniform float uDamping; uniform float uViscosity;
 void main(){
   vec4 s = texture(uState, vUv);
   float avg = 0.25 * (
@@ -114,6 +115,7 @@ void main(){
   s.g += (avg - s.r) * 2.0;
   s.g *= uDamping;
   s.r += s.g;
+  s.r = mix(s.r, avg, uViscosity); // 粘性: 格子スケールの細かい波（はしご状の筋・粒状ハイライト）を消してなめらかにする
   s.r *= 0.9995;
   o = s;
 }`;
@@ -369,6 +371,7 @@ function stepSim() {
   gl.uniform1i(P.update.u.uState, 0);
   gl.uniform2f(P.update.u.uTexel, 1 / state.w, 1 / state.h);
   gl.uniform1f(P.update.u.uDamping, PARAMS.damping);
+  gl.uniform1f(P.update.u.uViscosity, PARAMS.viscosity);
   gl.drawArrays(gl.TRIANGLES, 0, 3); swap();
 }
 function drawScene(t) {
